@@ -259,3 +259,42 @@ This scenario shows how an agent might use TOLBERT and an LLM to recommend relev
      - Optional follow-up prompts (e.g., “show me how this PR’s architecture differs from Paper X”).
 
 This same pattern generalizes to other tasks (bug-fix suggestion, design review, refactor planning) by swapping “papers” for “repos/files/functions” and adjusting what the LLM is asked to do with the retrieved context.
+
+### 10. Hierarchical Decoding with Tree Constraints
+
+For some applications you may want predicted paths to **respect the ontology** at inference time, i.e. each level’s prediction must be a valid child of the previous level. TOLBERT provides a small helper for this:
+
+```python
+from tolbert.decoding import greedy_hierarchical_decode
+
+with torch.no_grad():
+    out = model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+    )
+
+level_logits = out["level_logits"]  # dict: {str(level): (batch, C_level)}
+
+# parent_to_children[level] = {parent_idx: [child_idx, ...]}
+# You typically build this once from your ontology (e.g. nodes.jsonl with
+# node_id, level, parent_id) in the same index space used for training.
+parent_to_children = {
+    2: {  # mapping for level 2 children given level 1 parents
+        0: [0, 1],    # parent 0 at level 1 has children 0,1 at level 2
+        1: [2, 3, 4], # parent 1 at level 1 has children 2,3,4 at level 2
+    },
+    3: {
+        # ... mapping level-2 parents -> level-3 children ...
+    },
+}
+
+decoded = greedy_hierarchical_decode(
+    level_logits=level_logits,
+    parent_to_children=parent_to_children,
+    levels=[1, 2, 3],  # decode in this order
+)
+
+# `decoded` is {1: tensor(batch,), 2: tensor(batch,), 3: tensor(batch,)}
+```
+
+If no children are registered for a given `(level, parent_idx)`, the helper falls back to an unconstrained argmax for that example at that level. This behavior matches the inference-time procedure described in the paper (soft training constraints, hard decoding constraints).

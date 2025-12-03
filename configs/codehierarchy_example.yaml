@@ -1,0 +1,28 @@
+base_model_name: bert-base-uncased
+
+# Filled from scripts/build_codehierarchy_spans.py --level-sizes-out
+level_sizes:
+  1: 3    # e.g., Python/Java/C++
+  2: 5    # e.g., Web/ML/Systems/...
+  3: 50   # e.g., repo IDs
+
+spans_file: /data/tolbert/data/codehierarchy/spans_train.jsonl
+
+max_length: 256
+mask_probability: 0.15
+
+batch_size: 64
+num_workers: 4
+lr: 1.0e-4
+num_epochs: 5
+grad_clip: 1.0
+
+lambda_hier: 1.0
+lambda_path: 0.5
+lambda_contrast: 0.0
+contrast_temperature: 0.07
+
+log_every: 100
+output_dir: checkpoints/codehierarchy
+
+

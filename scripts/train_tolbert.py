@@ -17,6 +17,7 @@ from typing import Any, Dict
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+import os
 
 from tolbert.config import load_tolbert_config
 from tolbert.data import TreeOfLifeDataset, collate_tree_of_life_batch
@@ -60,7 +61,10 @@ def main() -> None:
     device = torch.device(args.device)
 
     # Tokenizer and dataset
-    tokenizer = AutoTokenizer.from_pretrained(cfg["base_model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg["base_model_name"],
+        cache_dir="/data/checkpoints/",  # noqa: E501
+    )
     spans_file = cfg["spans_file"]
     if not Path(spans_file).exists():
         raise FileNotFoundError(f"spans_file not found: {spans_file}")
@@ -106,6 +110,8 @@ def main() -> None:
                 attention_mask=attention_mask,
                 labels_mlm=labels_mlm,
                 level_targets=level_targets,
+                # Provide full paths so the model can compute path-consistency loss.
+                paths=batch.get("paths"),
             )
 
             loss = out["loss"]

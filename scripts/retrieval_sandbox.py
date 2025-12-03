@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch.nn import functional as F
 from transformers import AutoTokenizer
+import os
 
 from tolbert.config import load_tolbert_config
 from tolbert.data import TreeOfLifeDataset
@@ -150,7 +151,10 @@ def main() -> None:
     cfg = load_tolbert_config(args.config)
     device = torch.device(args.device)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg["base_model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg["base_model_name"],
+        cache_dir="/data/checkpoints/",  # noqa: E501
+    )
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():

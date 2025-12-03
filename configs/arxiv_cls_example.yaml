@@ -1,0 +1,32 @@
+base_model_name: bert-base-uncased
+
+# Fill this from scripts/build_arxiv_cls_spans.py --level-sizes-out
+# Example structure (numbers here are placeholders):
+# level_sizes:
+#   1: 1    # e.g., top-level domains like "cs"
+#   2: 10   # e.g., fine-grained arXiv categories like "cs.LG", "cs.CL", ...
+level_sizes:
+  1: 1
+  2: 2
+
+spans_file: /data/tolbert/data/arxiv_cls/spans_train.jsonl
+
+max_length: 256
+mask_probability: 0.15
+
+batch_size: 64
+num_workers: 4
+lr: 1.0e-4
+num_epochs: 5
+grad_clip: 1.0
+
+lambda_hier: 1.0
+lambda_path: 0.5
+lambda_contrast: 0.0
+contrast_temperature: 0.07
+
+log_every: 100
+output_dir: checkpoints/arxiv_cls
+
+
+

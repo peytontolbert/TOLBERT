@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch.nn import functional as F
 from transformers import AutoTokenizer
+import os
 
 from tolbert.config import load_tolbert_config
 from tolbert.modeling import TOLBERT, TOLBERTConfig
@@ -250,7 +251,10 @@ def main() -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg["base_model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg["base_model_name"],
+        cache_dir="/data/checkpoints/",  # noqa: E501
+    )
     model = build_model(cfg, str(checkpoint_path), device=device)
 
     # Load and span-ize the PR

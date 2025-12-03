@@ -64,7 +64,7 @@ flowchart TD
     D --> E[Taxonomy-Aligned Output]
 ```
 
-### How This Fits Your Repository-Universe Architecture
+### Architecture
 
 You can structure your entire software + research paper universe as a **Tree of Life of computation**:
 
@@ -78,3 +78,22 @@ TOLBERT encodes meaning **relative to this ancestral lineage**, giving you multi
 - Global similarity → repo similarity → module similarity → function/section similarity.
 
 For detailed formal specification and derivations, see `design.md`. For implementation-ready guidance, see `docs/`.
+
+### Reference datasets & helper scripts
+
+This repo includes small, self-contained scripts for building span files and simple ontologies for the
+reference benchmarks mentioned in the paper:
+
+- CodeHierarchy:
+  - `scripts/build_codehierarchy_spans.py`
+  - Example config: `configs/codehierarchy_example.yaml`
+- ResearchHierarchy (WOS-style 3-level taxonomy):
+  - `scripts/build_wos_spans.py`
+  - Generalized 3-level paper-side builder: `scripts/build_researchhierarchy_spans.py`
+  - Example config: `configs/wos_example.yaml`
+- ArXiv-CLS (2-level arXiv category hierarchy):
+  - `scripts/build_arxiv_cls_spans.py`
+  - Example config: `configs/arxiv_cls_example.yaml`
+
+Each script produces a `spans_out` JSONL file with `node_path` annotations that can be plugged directly
+into `scripts/train_tolbert.py` via the `spans_file` and `level_sizes` fields in your config.

@@ -1,0 +1,27 @@
+base_model_name: bert-base-uncased
+
+level_sizes:
+  1: 6    # e.g., top-level WOS fields
+  2: 18   # e.g., subfields
+  3: 118  # e.g., disciplines
+
+spans_file: /data/tolbert/data/wos/spans_train.jsonl
+
+max_length: 256
+mask_probability: 0.15
+
+batch_size: 64
+num_workers: 4
+lr: 1.0e-4
+num_epochs: 5
+grad_clip: 1.0
+
+lambda_hier: 1.0
+lambda_path: 0.5
+lambda_contrast: 0.0
+contrast_temperature: 0.07
+
+log_every: 100
+output_dir: checkpoints/wos
+
+
