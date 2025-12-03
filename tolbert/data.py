@@ -12,7 +12,10 @@ from transformers import PreTrainedTokenizerBase
 @dataclass
 class SpanRecord:
     text: str
+    # Canonical single path used for per-level classification targets.
     node_path: Optional[List[int]]
+    # Full raw record, which may include richer DAG-style fields such as
+    # `node_paths` (multiple valid paths) in addition to `node_path`.
     raw: Dict[str, Any]
 
 
@@ -52,7 +55,27 @@ class TreeOfLifeDataset(Dataset):
                     continue
                 obj = json.loads(line)
                 text = obj["text"]
-                node_path = obj.get("node_path")
+
+                # Support both legacy single-path and richer DAG-style formats:
+                #   - "node_path": [v0, v1, ..., vK]
+                #   - "node_paths": [[v0, v1, ..., vK], [v0, v1', ..., vK'], ...]
+                #
+                # We keep a single canonical path (first path if multiple are
+                # provided) for per-level classification, while preserving the
+                # richer structure in `raw` for path-consistency and
+                # contrastive losses.
+                node_path: Optional[List[int]] = None
+                if "node_paths" in obj and obj["node_paths"] is not None:
+                    paths_val = obj["node_paths"]
+                    if isinstance(paths_val, list) and paths_val:
+                        first = paths_val[0]
+                        if isinstance(first, (list, tuple)):
+                            node_path = [int(x) for x in first]
+                elif "node_path" in obj and obj["node_path"] is not None:
+                    single = obj["node_path"]
+                    if isinstance(single, (list, tuple)):
+                        node_path = [int(x) for x in single]
+
                 self._records.append(SpanRecord(text=text, node_path=node_path, raw=obj))
 
     def __len__(self) -> int:
@@ -128,7 +151,7 @@ class TreeOfLifeDataset(Dataset):
         attention_mask = tokens.get("attention_mask", torch.ones_like(input_ids))
         labels_mlm = self._make_mlm_labels(input_ids.clone())
 
-        # Build per-level targets from node_path if available.
+        # Build per-level targets from canonical node_path if available.
         level_targets: Dict[int, int] = {}
         if rec.node_path is not None:
             for level, node_id in enumerate(rec.node_path):
@@ -144,9 +167,15 @@ class TreeOfLifeDataset(Dataset):
             "level_targets": level_targets,
         }
 
-        # Keep the full path around for potential contrastive loss.
-        if rec.node_path is not None:
-            sample["paths"] = list(rec.node_path)
+        # Keep the full path information around for path-consistency and
+        # contrastive losses. Prefer a richer `node_paths` field (multiple
+        # valid paths for DAGs / multi-parent ontologies) if present; fall
+        # back to a single `node_path` otherwise.
+        paths = rec.raw.get("node_paths")
+        if paths is None and rec.node_path is not None:
+            paths = [list(rec.node_path)]
+        if paths is not None:
+            sample["paths"] = paths
 
         return sample
 

@@ -248,14 +248,18 @@ This section summarizes **what you need on disk and which knobs to set** before 
     - `span_id`: unique ID per training span (code snippet, paragraph, etc.).
     - `text`: raw text for MLM and encoding.
     - `source_id`: identifier of the underlying file/section/paper.
-    - Either:
-      - `node_path`: full list of node IDs `[v_0, ..., v_K]`, or
+    - One of the following:
+      - `node_path`: full list of node IDs `[v_0, ..., v_K]` (tree / single-parent case), or
+      - `node_paths`: list of full paths `[[v_0, ..., v_K], [v_0, ..., v_K'], ...]`
+        for **DAG / multi-parent** ontologies (multiple valid ancestors), or
       - `level_k_id` columns: `level_0_id`, `level_1_id`, ..., `level_K_id`.
-  - **Minimal JSONL example (with `node_path`)**:
+  - **Minimal JSONL examples**:
 
 ```json
 {"span_id": "s0", "text": "def forward(...):", "source_id": "repoA/file.py", "node_path": [0, 1, 2]}
 {"span_id": "s1", "text": "We propose TOLBERT...", "source_id": "paperX/section1", "node_path": [0, 3, 5]}
+{"span_id": "s2", "text": "A cross-cutting repo...", "source_id": "repoB/file.py",
+ "node_paths": [[0, 1, 10, 42], [0, 2, 7, 42]]}
 ```
 
 You can store these as Parquet for scale, as long as the column names and semantics match the above.

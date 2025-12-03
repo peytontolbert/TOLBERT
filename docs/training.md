@@ -70,16 +70,16 @@ In practice, paths are often **incomplete** and the underlying graph is closer t
   - Implementation-wise, treat those deeper levels as **unsupervised**:
     - For \(L_{\text{hier}}\): either skip those levels from the sum for that example, or set the per-level target index to an `ignore_index` (e.g. `-100`) so the cross-entropy does not contribute.
     - For \(L_{\text{path}}\): skip any level pair \((k, k+1)\) where one or both levels are unknown for that span.
-
+  
 - **DAG reality (multi-parent nodes)**:
   - Your `RepoGraph` / `PaperGraph` may give nodes **multiple plausible parents** (e.g., a repo that sits at the intersection of two domains).
-  - Two common strategies:
-    - **Canonicalize to a tree** when building the training taxonomy (see `tree_of_life.md` for discussion of heuristics), e.g. choose the parent with:
-      - Highest edge weight / semantic affinity, or
-      - Most traffic / spans, with a deterministic tie-break.
-    - **Allow multiple valid ancestors in \(L_{\text{path}}\)**:
-      - When constructing \(I_{k+1}^{\text{invalid}}\), mark a node invalid **only if none of its ancestors at level \(k\)** match any of the span’s allowed parents at that level.
-      - This lets you respect DAG structure while still enforcing local consistency.
+  - The implementation supports this via a richer span format:
+    - Use `node_paths` to provide **multiple full paths per span**:
+      - `node_paths = [[v_0, ..., v_K], [v_0, ..., v_K'], ...]`.
+    - A single **canonical path** (the first) is used to derive per-level targets for \(L_{\text{hier}}\).
+    - \(L_{\text{path}}\) and \(L_{\text{contrast}}\) consume the full `node_paths` set:
+      - For \(L_{\text{path}}\): parent→children mappings are built from all provided paths, and the KL-based consistency loss is computed over the resulting rolled-up distributions.
+      - For \(L_{\text{contrast}}\): the shared depth between two examples is the **maximum** depth over any pair of their paths, so positives/negatives respect multi-parent ancestry.
 
 ### 5. Contrastive Tree Loss
 

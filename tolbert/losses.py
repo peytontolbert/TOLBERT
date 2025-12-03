@@ -20,27 +20,91 @@ def _compute_shared_depth(pi: Sequence[int], pj: Sequence[int]) -> int:
     return depth
 
 
+def _normalize_paths_arg(
+    paths: Sequence[Sequence[int]] | Sequence[Sequence[Sequence[int]]],
+) -> List[List[List[int]]]:
+    """
+    Normalize `paths` into a list of per-example path sets.
+
+    Accepted input formats:
+      - Tree-style (single path per example):
+            paths = [[v0, v1, ...], [v0, v1', ...], ...]
+      - DAG-style (multiple valid paths per example):
+            paths = [
+              [[v0, v1, ...], [v0, v1', ...]],
+              [[v0, u1, ...]],
+              ...
+            ]
+
+    Output format:
+        List[ List[List[int]] ], where outer index is batch example and each
+        inner list is one valid path for that example.
+    """
+    norm: List[List[List[int]]] = []
+    for p in paths:
+        if not p:
+            norm.append([])
+            continue
+        first = p[0]
+        # If first element is an int, we have a single path.
+        if isinstance(first, int):
+            norm.append([[int(x) for x in p]])  # type: ignore[arg-type]
+        else:
+            # Assume list/tuple of paths.
+            path_set: List[List[int]] = []
+            for sub in p:  # type: ignore[assignment]
+                if isinstance(sub, (list, tuple)):
+                    path_set.append([int(x) for x in sub])
+            norm.append(path_set)
+    return norm
+
+
+def _compute_shared_depth_sets(
+    paths_i: List[List[int]],
+    paths_j: List[List[int]],
+) -> int:
+    """
+    Deepest shared depth between two *sets* of paths (for DAGs).
+
+    We take the maximum shared depth over all path pairs (pi in paths_i,
+    pj in paths_j).
+    """
+    max_depth = 0
+    for pi in paths_i:
+        for pj in paths_j:
+            d = _compute_shared_depth(pi, pj)
+            if d > max_depth:
+                max_depth = d
+    return max_depth
+
+
 def tree_contrastive_loss(
     embeddings: torch.Tensor,
-    paths: Sequence[Sequence[int]],
+    paths: Sequence[Sequence[int]] | Sequence[Sequence[Sequence[int]]],
     temperature: float = 0.07,
 ) -> torch.Tensor:
     """
     Depth-weighted tree-aware InfoNCE-style contrastive loss.
 
     This implements the hierarchical supervised contrastive objective
-    described in the paper:
+    described in the paper, extended to handle DAGs / multiple paths per
+    example:
 
-      - Each example i has a path (y_1^{(i)}, ..., y_L^{(i)}).
+      - Each example i has one or more valid paths
+            (y_1^{(i,m)}, ..., y_L^{(i,m)})
+        through the ontology graph.
       - For a pair (i, j), define depth(i, j) as the deepest level at
-        which they share the same label beyond the root.
+        which they share the same label beyond the root **along any**
+        of their respective paths.
       - Positives P(i) are all j != i with depth(i, j) >= 1.
       - Each positive pair is weighted by w_ij ∝ depth(i, j).
       - Negatives are examples with depth(i, j) == 0 (only root shared).
 
     Args:
         embeddings: (batch, dim) L2-normalized embeddings (e.g., proj outputs).
-        paths: sequence of per-example paths, each a sequence of node ids.
+        paths: sequence of per-example paths, which may be:
+            - a single path per example: [[v0, v1, ...], ...], or
+            - multiple paths per example: [[[v0, v1, ...], [v0, v1', ...]], ...]
         temperature: softmax temperature for contrastive logits.
     """
     device = embeddings.device
@@ -49,13 +113,16 @@ def tree_contrastive_loss(
     if batch_size <= 1:
         return torch.tensor(0.0, device=device)
 
-    # Compute pairwise shared depths
+    # Normalize paths into per-example path sets to support DAGs.
+    path_sets = _normalize_paths_arg(paths)
+
+    # Compute pairwise shared depths over path sets.
     depth_mat = torch.zeros((batch_size, batch_size), dtype=torch.float32, device=device)
     for i in range(batch_size):
         for j in range(batch_size):
             if i == j:
                 continue
-            d = _compute_shared_depth(paths[i], paths[j])
+            d = _compute_shared_depth_sets(path_sets[i], path_sets[j])
             depth_mat[i, j] = float(d)
 
     # Positives: depth >= 1
@@ -69,10 +136,11 @@ def tree_contrastive_loss(
     sim = embeddings @ embeddings.T  # (B, B)
     sim = sim / temperature
 
-    # Exclude self from denominators by setting diag to very small value
-    # (will be masked out later via logsumexp).
+    # Exclude self from denominators by setting diag to a very large
+    # negative value (rather than -inf) to avoid NaNs when multiplied
+    # by zero weights later on.
     diag_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-    sim = sim.masked_fill(diag_mask, float("-inf"))
+    sim = sim.masked_fill(diag_mask, -1e9)
 
     # Log-softmax-like normalization per row
     logsumexp = torch.logsumexp(sim, dim=1, keepdim=True)  # (B, 1)
@@ -80,12 +148,14 @@ def tree_contrastive_loss(
 
     # Depth-based weights w_ij = depth(i,j) / L_i for positives, where
     # L_i is the maximum usable depth for anchor i (excluding root).
-    # This aligns with the paper's suggestion w_ij ∝ depth / L.
-    # Compute L_i per-anchor from its own path length.
-    anchor_depths = []
-    for p in paths:
-        # depth is len(p) - 1 at most (index 0 is root)
-        anchor_depths.append(max(1, len(p) - 1))
+    # For DAGs, we use the maximum depth over that example's path set.
+    anchor_depths: List[int] = []
+    for path_set in path_sets:
+        max_len = 1
+        for p in path_set:
+            if len(p) - 1 > max_len:
+                max_len = len(p) - 1
+        anchor_depths.append(max(1, max_len))
     L = torch.tensor(anchor_depths, dtype=torch.float32, device=device).unsqueeze(1)  # (B, 1)
 
     # Avoid divide-by-zero; we clamped to at least 1 above.

@@ -87,26 +87,25 @@ class TOLBERT(nn.Module):
     def _compute_path_consistency_loss(
         self,
         level_logits: Dict[str, torch.Tensor],
-        paths: Optional[Sequence[Sequence[int]]],
+        paths: Optional[Sequence[Sequence[int]] | Sequence[Sequence[Sequence[int]]]],
     ) -> Optional[torch.Tensor]:
         """
         Batch-local implementation of the path-consistency loss described
-        in the paper / training docs.
+        in the paper / training docs, extended to handle DAGs / multi-parent
+        ontologies.
 
         For each adjacent level pair (ℓ-1, ℓ), we:
-          - build a child -> {parent,...} mapping from the observed `paths`
-          - compute softmax over level-ℓ logits
-          - for each example, identify which level-ℓ nodes are *invalid*
-            given its level-(ℓ-1) parent
-          - penalize probability mass assigned to invalid nodes:
+          - build a parent -> {child,...} mapping from the observed `paths`
+            across the batch (allowing multiple parents per child),
+          - compute softmax over level-ℓ logits,
+          - roll level-ℓ probabilities up to the parent space and
+            encourage agreement between:
+                - the distribution implied by children, and
+                - the model's own distribution at level ℓ-1.
 
-                L_path ≈ Σ_{examples, ℓ} Σ_{i ∈ I_{ℓ}^{invalid}} p_ℓ(i)
-
-        This matches the "penalize mass on invalid children" formulation:
-        only nodes whose recorded parents do *not* match the example's
-        parent at level ℓ-1 contribute to the loss. Nodes with unknown
-        parent assignments in the batch are treated as neutral (neither
-        explicitly valid nor invalid).
+        In a pure tree, each child has exactly one parent; in a DAG, a child
+        may appear under multiple parents across the provided paths. This
+        implementation treats all observed parent-child relations as valid.
         """
         if paths is None:
             return None
@@ -116,20 +115,26 @@ class TOLBERT(nn.Module):
 
         device = next(self.parameters()).device
 
-        # Convert paths (python lists) into a tensor for easier indexing.
-        # paths are assumed to be full node ids including root at index 0.
-        max_len = max(len(p) for p in paths)
-        batch_size = len(paths)
-        path_tensor = torch.full(
-            (batch_size, max_len),
-            fill_value=-100,
-            dtype=torch.long,
-            device=device,
-        )
-        for i, p in enumerate(paths):
-            path_tensor[i, : len(p)] = torch.tensor(p, dtype=torch.long, device=device)
+        # Normalize paths into per-example path sets to support DAGs.
+        # Each element in `path_sets` is a list of paths (lists of node ids).
+        path_sets: list[list[list[int]]] = []
+        for p in paths:
+            if not p:
+                path_sets.append([])
+                continue
+            first = p[0]
+            if isinstance(first, int):
+                path_sets.append([[int(x) for x in p]])  # type: ignore[arg-type]
+            else:
+                path_set: list[list[int]] = []
+                for sub in p:  # type: ignore[assignment]
+                    if isinstance(sub, (list, tuple)):
+                        path_set.append([int(x) for x in sub])
+                path_sets.append(path_set)
 
-        total_mass = 0.0
+        batch_size = len(path_sets)
+
+        total_kl = 0.0
         num_terms = 0
 
         # We assume level index ℓ in the paper corresponds to path index ℓ,
@@ -142,72 +147,67 @@ class TOLBERT(nn.Module):
             if str(level_prev) not in level_logits or str(level_curr) not in level_logits:
                 continue
 
+            logits_prev = level_logits[str(level_prev)]  # (B, C_prev)
             logits_curr = level_logits[str(level_curr)]  # (B, C_curr)
 
+            probs_prev = F.softmax(logits_prev, dim=-1)  # (B, C_prev)
             probs_curr = F.softmax(logits_curr, dim=-1)  # (B, C_curr)
 
-            # Build a child -> parent map for this level-pair from batch paths.
-            # We treat class indices at level ℓ as node ids at that level, and
-            # assume a single canonical parent per child (tree setting). If the
-            # same child appears with different parents in the batch, the last
-            # observed parent wins, which is acceptable as long as the ontology
-            # is a proper tree as in the main TOLBERT setup.
-            child_parent: Dict[int, int] = {}
+            # Build parent -> children map for this level-pair from batch paths.
+            parent_to_children: Dict[int, set[int]] = {}
             for b in range(batch_size):
-                if level_prev >= path_tensor.size(1) or level_curr >= path_tensor.size(1):
-                    continue
+                for path in path_sets[b]:
+                    if len(path) <= max(level_prev, level_curr):
+                        continue
+                    parent_id = path[level_prev]
+                    child_id = path[level_curr]
+                    if parent_id < 0 or child_id < 0:
+                        continue
+                    if parent_id not in parent_to_children:
+                        parent_to_children[parent_id] = set()
+                    parent_to_children[parent_id].add(child_id)
 
-                parent_id = path_tensor[b, level_prev].item()
-                child_id = path_tensor[b, level_curr].item()
-                if parent_id < 0 or child_id < 0:
-                    continue
-                child_parent[child_id] = parent_id
-
-            if not child_parent:
+            if not parent_to_children:
                 continue
 
-            num_classes = logits_curr.size(-1)
-
-            # For each example, measure probability mass on invalid children.
-            for b in range(batch_size):
-                if level_prev >= path_tensor.size(1) or level_curr >= path_tensor.size(1):
+            num_parents = logits_prev.size(-1)
+            rolled = torch.zeros_like(probs_prev)
+            for parent_id, children_ids in parent_to_children.items():
+                if parent_id < 0 or parent_id >= num_parents:
                     continue
-
-                parent_id = path_tensor[b, level_prev].item()
-                child_id = path_tensor[b, level_curr].item()
-                if parent_id < 0 or child_id < 0:
-                    continue
-
-                # Construct invalid mask for this example:
-                #  - valid if this class has the current parent_id as its parent
-                #  - invalid if it has a *different* parent id
-                #  - neutral (ignored) if we never observed a parent for this class id
-                invalid_indices: list[int] = []
-                for cls_idx in range(num_classes):
-                    p = child_parent.get(cls_idx)
-                    if p is None:
-                        # No parent information for this class in the batch;
-                        # do not treat it as explicitly invalid.
-                        continue
-                    if parent_id != p:
-                        invalid_indices.append(cls_idx)
-
-                if not invalid_indices:
-                    continue
-
-                cls_tensor = torch.tensor(
-                    invalid_indices,
+                children_idx = torch.tensor(
+                    list(children_ids),
                     dtype=torch.long,
                     device=device,
                 )
-                invalid_mass = probs_curr[b, cls_tensor].sum()
-                total_mass = total_mass + invalid_mass
-                num_terms += 1
+                children_idx = children_idx[
+                    (children_idx >= 0) & (children_idx < probs_curr.size(-1))
+                ]
+                if children_idx.numel() == 0:
+                    continue
+                rolled[:, parent_id] = probs_curr[:, children_idx].sum(dim=-1)
+
+            # Renormalize rolled-up distribution to avoid degenerate zeros.
+            rolled_sum = rolled.sum(dim=-1, keepdim=True)
+            rolled_sum = torch.clamp(rolled_sum, min=1e-8)
+            rolled = rolled / rolled_sum
+
+            # Ensure numerical stability for KL
+            probs_prev_clamped = torch.clamp(probs_prev, min=1e-8)
+            rolled_clamped = torch.clamp(rolled, min=1e-8)
+
+            kl = F.kl_div(
+                probs_prev_clamped.log(),
+                rolled_clamped,
+                reduction="batchmean",
+            )
+            total_kl = total_kl + kl
+            num_terms += 1
 
         if num_terms == 0:
             return None
 
-        return total_mass / float(num_terms)
+        return total_kl / float(num_terms)
 
     def forward(
         self,
@@ -215,7 +215,7 @@ class TOLBERT(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels_mlm: Optional[torch.Tensor] = None,
         level_targets: Optional[Dict[int, torch.Tensor]] = None,
-        paths: Optional[Sequence[Sequence[int]]] = None,
+        paths: Optional[Sequence[Sequence[int]] | Sequence[Sequence[Sequence[int]]]] = None,
     ) -> Dict[str, Any]:
         """
         Args:
