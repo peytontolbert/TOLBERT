@@ -146,9 +146,13 @@ class TOLBERT(nn.Module):
 
             probs_curr = F.softmax(logits_curr, dim=-1)  # (B, C_curr)
 
-            # Build child -> {parent,...} map for this level-pair from batch paths.
-            # We treat class indices at level ℓ as node ids at that level.
-            child_parents: Dict[int, set] = {}
+            # Build a child -> parent map for this level-pair from batch paths.
+            # We treat class indices at level ℓ as node ids at that level, and
+            # assume a single canonical parent per child (tree setting). If the
+            # same child appears with different parents in the batch, the last
+            # observed parent wins, which is acceptable as long as the ontology
+            # is a proper tree as in the main TOLBERT setup.
+            child_parent: Dict[int, int] = {}
             for b in range(batch_size):
                 if level_prev >= path_tensor.size(1) or level_curr >= path_tensor.size(1):
                     continue
@@ -157,11 +161,9 @@ class TOLBERT(nn.Module):
                 child_id = path_tensor[b, level_curr].item()
                 if parent_id < 0 or child_id < 0:
                     continue
-                if child_id not in child_parents:
-                    child_parents[child_id] = set()
-                child_parents[child_id].add(parent_id)
+                child_parent[child_id] = parent_id
 
-            if not child_parents:
+            if not child_parent:
                 continue
 
             num_classes = logits_curr.size(-1)
@@ -177,17 +179,17 @@ class TOLBERT(nn.Module):
                     continue
 
                 # Construct invalid mask for this example:
-                #  - valid if this class has the current parent_id among its parents
-                #  - invalid if it has a *different* parent set
-                #  - neutral (ignored) if we never observed a parent for this child id
+                #  - valid if this class has the current parent_id as its parent
+                #  - invalid if it has a *different* parent id
+                #  - neutral (ignored) if we never observed a parent for this class id
                 invalid_indices: list[int] = []
                 for cls_idx in range(num_classes):
-                    parents = child_parents.get(cls_idx)
-                    if parents is None:
-                        # No parent information for this child in the batch;
+                    p = child_parent.get(cls_idx)
+                    if p is None:
+                        # No parent information for this class in the batch;
                         # do not treat it as explicitly invalid.
                         continue
-                    if parent_id not in parents:
+                    if parent_id != p:
                         invalid_indices.append(cls_idx)
 
                 if not invalid_indices:

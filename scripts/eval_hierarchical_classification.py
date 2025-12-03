@@ -108,6 +108,14 @@ def main() -> None:
     path_correct = 0
     path_total = 0
 
+    # For hierarchical precision/recall/F1 (Kiritchenko-style, single-path case),
+    # we treat each (level, node_id) pair as one "label". Since every supervised
+    # level has exactly one node, this reduces to counting how many levels are
+    # correct across all examples.
+    hier_total_true = 0
+    hier_total_pred = 0
+    hier_total_correct = 0
+
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
@@ -143,6 +151,13 @@ def main() -> None:
 
                 level_correct[level_int] = level_correct.get(level_int, 0) + num_correct
                 level_total[level_int] = level_total.get(level_int, 0) + num_total
+
+                # For hierarchical precision/recall we count each supervised
+                # (example, level) as one "true" label and one "predicted" label.
+                # A label is correct iff the level prediction matches the target.
+                hier_total_true += num_total
+                hier_total_pred += num_total
+                hier_total_correct += num_correct
 
                 # Update per-example correctness for path accuracy
                 # Only consider examples where this level is supervised.
@@ -181,6 +196,27 @@ def main() -> None:
 
     path_acc = path_correct / max(1, path_total)
     print(f"Path accuracy (all supervised levels correct): {path_acc:.4f} (n={path_total})")
+
+    # Global hierarchical precision/recall/F1 over the full path, adapted from
+    # Kiritchenko et al. to the single-path, single-label-per-level setting.
+    # Here:
+    #   - "true labels"  = all supervised (example, level) pairs,
+    #   - "pred labels"  = one prediction per supervised level,
+    #   - "correct"      = prediction matches the ground-truth node at that level.
+    if hier_total_true > 0 and hier_total_pred > 0:
+        hier_prec = hier_total_correct / hier_total_pred
+        hier_rec = hier_total_correct / hier_total_true
+        if hier_prec + hier_rec > 0.0:
+            hier_f1 = 2.0 * hier_prec * hier_rec / (hier_prec + hier_rec)
+        else:
+            hier_f1 = 0.0
+        print(
+            "Hierarchical P/R/F1 over paths "
+            f"(micro-style over all levels): "
+            f"precision={hier_prec:.4f} recall={hier_rec:.4f} F1={hier_f1:.4f}"
+        )
+    else:
+        print("Hierarchical P/R/F1 over paths: undefined (no supervised labels).")
 
 
 if __name__ == "__main__":

@@ -92,9 +92,12 @@ from tolbert.losses import tree_contrastive_loss
 from tolbert.config import load_tolbert_config
 ```
 
-### Minimal training loop (planned)
+### Minimal training loop (with curriculum + multi-domain support)
 
-The following example is **non-functional until the `tolbert` package exists**, but shows the intended API surface:
+The following example mirrors `scripts/train_tolbert.py` and shows how to configure:
+
+- single- vs multi-domain spans files, and
+- a simple curriculum over hierarchical, path-consistency, and contrastive losses.
 
 ```python
 import torch
@@ -111,11 +114,31 @@ def main():
     cfg = load_tolbert_config("configs/tolbert.yaml")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["base_model_name"])
-    dataset = TreeOfLifeDataset(
-        spans_file=cfg["spans_file"],
-        tokenizer=tokenizer,
-        max_length=cfg.get("max_length", 256),
-    )
+
+    # Either a single spans_file or a list of spans_files (e.g., code + papers).
+    if "spans_files" in cfg:
+        # See scripts/train_tolbert.py::_build_dataset for full behavior.
+        from torch.utils.data import ConcatDataset
+
+        datasets = [
+            TreeOfLifeDataset(
+                spans_file=spans_path,
+                tokenizer=tokenizer,
+                max_length=cfg.get("max_length", 256),
+            )
+            for spans_path in cfg["spans_files"]
+        ]
+        if len(datasets) == 1:
+            dataset = datasets[0]
+        else:
+            dataset = ConcatDataset(datasets)
+    else:
+        dataset = TreeOfLifeDataset(
+            spans_file=cfg["spans_file"],
+            tokenizer=tokenizer,
+            max_length=cfg.get("max_length", 256),
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.get("batch_size", 64),
@@ -135,25 +158,58 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-4))
 
+    curriculum_cfg = cfg.get("curriculum")
+    global_step = 0
+
+    def get_stage(step: int):
+        if not curriculum_cfg or not curriculum_cfg.get("enabled", False):
+            return None
+        for stage in curriculum_cfg.get("stages", []):
+            start = int(stage.get("start_step", 0))
+            end = stage.get("end_step")
+            if step < start:
+                continue
+            if end is not None and step >= int(end):
+                continue
+            return stage
+        return None
+
     for batch in dataloader:
+        global_step += 1
         optimizer.zero_grad()
+
+        stage = get_stage(global_step)
+        lambda_hier = (stage or {}).get("lambda_hier", cfg.get("lambda_hier", 1.0))
+        lambda_path = (stage or {}).get("lambda_path", cfg.get("lambda_path", 0.0))
+        lambda_contrast = (stage or {}).get("lambda_contrast", cfg.get("lambda_contrast", 0.0))
+
+        level_targets = batch.get("level_targets") or {}
+        if stage and "max_supervised_level" in stage:
+            max_level = int(stage["max_supervised_level"])
+            level_targets = {lvl: tgt for lvl, tgt in level_targets.items() if lvl <= max_level}
 
         out = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels_mlm=batch.get("labels_mlm"),
-            level_targets=batch.get("level_targets"),
+            level_targets=level_targets,
+            paths=batch.get("paths") if lambda_path > 0.0 else None,
         )
 
-        loss = out["loss"]
+        comps = out["loss_components"]
+        loss = comps["mlm"]
+        if "hier" in comps and lambda_hier != 0.0:
+            loss = loss + lambda_hier * comps["hier"]
+        if "path" in comps and lambda_path != 0.0:
+            loss = loss + lambda_path * comps["path"]
 
-        if cfg.get("lambda_contrast", 0.0) > 0.0 and "paths" in batch:
+        if lambda_contrast > 0.0 and "paths" in batch:
             contrast_loss = tree_contrastive_loss(
                 embeddings=out["proj"],
                 paths=batch["paths"],
                 temperature=cfg.get("contrast_temperature", 0.07),
             )
-            loss = loss + cfg["lambda_contrast"] * contrast_loss
+            loss = loss + lambda_contrast * contrast_loss
 
         loss.backward()
         optimizer.step()

@@ -1,5 +1,5 @@
 """
-Evaluate TOLBERT embeddings on retrieval-style tasks.
+Evaluate embeddings on retrieval-style tasks.
 
 This script computes:
   - MRR (Mean Reciprocal Rank)
@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch.nn import functional as F
-from transformers import AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 import os
 
 from tolbert.config import load_tolbert_config
@@ -40,7 +40,7 @@ from tolbert.data import TreeOfLifeDataset
 from tolbert.modeling import TOLBERT, TOLBERTConfig
 
 
-def build_model(cfg: Dict[str, Any], checkpoint: str, device: torch.device) -> TOLBERT:
+def build_tolbert_model(cfg: Dict[str, Any], checkpoint: str, device: torch.device) -> TOLBERT:
     model_cfg = TOLBERTConfig(
         base_model_name=cfg["base_model_name"],
         level_sizes=cfg["level_sizes"],
@@ -54,7 +54,7 @@ def build_model(cfg: Dict[str, Any], checkpoint: str, device: torch.device) -> T
     return model
 
 
-def encode_spans(
+def encode_spans_tolbert(
     model: TOLBERT,
     tokenizer,
     spans_file: str,
@@ -62,7 +62,8 @@ def encode_spans(
     device: torch.device,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """
-    Encode all spans in `spans_file` into embeddings and return (emb_mat, raw_records).
+    Encode all spans in `spans_file` into TOLBERT embeddings (proj head) and
+    return (emb_mat, raw_records).
 
     This mirrors the logic in scripts/retrieval_sandbox.py but returns the full
     embedding matrix for evaluation purposes.
@@ -89,6 +90,51 @@ def encode_spans(
         with torch.no_grad():
             out = model(input_ids=input_ids, attention_mask=attention_mask)
         embs.append(out["proj"].squeeze(0).cpu())
+        metas.append(rec.raw)
+
+    if not embs:
+        return torch.empty(0), metas
+    return torch.stack(embs, dim=0), metas
+
+
+def encode_spans_hf_encoder(
+    model: AutoModel,
+    tokenizer,
+    spans_file: str,
+    max_length: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    """
+    Encode all spans using a vanilla HF encoder (e.g., BERT / CodeBERT /
+    ModernBERT) and return CLS embeddings.
+
+    This is used for baseline retrieval comparisons where we do not have
+    TOLBERT's projection head and simply use the encoder's [CLS] representation.
+    """
+    dataset = TreeOfLifeDataset(
+        spans_file=spans_file,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
+
+    embs: List[torch.Tensor] = []
+    metas: List[Dict[str, Any]] = []
+
+    for rec in dataset._records:  # type: ignore[attr-defined]
+        tokens = tokenizer(
+            rec.text,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+        )
+        input_ids = tokens["input_ids"].to(device)
+        attention_mask = tokens["attention_mask"].to(device)
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+        # Standard HF encoder output: last_hidden_state[:, 0, :] is [CLS]
+        cls = out.last_hidden_state[:, 0, :]
+        embs.append(cls.squeeze(0).cpu())
         metas.append(rec.raw)
 
     if not embs:
@@ -259,9 +305,17 @@ def compute_branch_consistency_at_k(
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Evaluate TOLBERT retrieval (MRR, Precision@K).")
+    ap = argparse.ArgumentParser(description="Evaluate retrieval (MRR, Precision@K, branch consistency).")
     ap.add_argument("--config", type=str, required=True, help="Training config used for the model.")
-    ap.add_argument("--checkpoint", type=str, required=True, help="Path to model .pt checkpoint.")
+    ap.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help=(
+            "For mode=tolbert: path to .pt checkpoint (state_dict). "
+            "For mode=hf_encoder: HF model name or directory to load via AutoModel."
+        ),
+    )
     ap.add_argument(
         "--index-spans",
         type=str,
@@ -292,6 +346,17 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use.",
     )
+    ap.add_argument(
+        "--mode",
+        type=str,
+        default="tolbert",
+        choices=["tolbert", "hf_encoder"],
+        help=(
+            "Embedding backend: 'tolbert' (default, uses TOLBERT proj head) "
+            "or 'hf_encoder' (vanilla HF encoder CLS for baselines like BERT, "
+            "SciBERT, CodeBERT, ModernBERT)."
+        ),
+    )
     return ap.parse_args()
 
 
@@ -308,13 +373,25 @@ def main() -> None:
         raise FileNotFoundError(f"query_spans not found: {query_spans_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        cfg["base_model_name"],
+        cfg["base_model_name"] if args.mode == "tolbert" else args.checkpoint,
         cache_dir="/data/checkpoints/",  # noqa: E501
     )
-    model = build_model(cfg, checkpoint=args.checkpoint, device=device)
+
+    if args.mode == "tolbert":
+        model = build_tolbert_model(cfg, checkpoint=args.checkpoint, device=device)
+        encode_fn = encode_spans_tolbert
+    else:
+        # Vanilla HF encoder baseline (BERT, SciBERT, CodeBERT, ModernBERT, etc.)
+        model = AutoModel.from_pretrained(
+            args.checkpoint,
+            cache_dir="/data/checkpoints/",  # noqa: E501
+        )
+        model.to(device)
+        model.eval()
+        encode_fn = encode_spans_hf_encoder
 
     print(f"Encoding index spans from {index_spans_path} ...")
-    index_embs, index_metas = encode_spans(
+    index_embs, index_metas = encode_fn(
         model=model,
         tokenizer=tokenizer,
         spans_file=str(index_spans_path),
@@ -323,7 +400,7 @@ def main() -> None:
     )
 
     print(f"Encoding query spans from {query_spans_path} ...")
-    query_embs, query_metas = encode_spans(
+    query_embs, query_metas = encode_fn(
         model=model,
         tokenizer=tokenizer,
         spans_file=str(query_spans_path),
